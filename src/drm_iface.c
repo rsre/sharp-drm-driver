@@ -14,6 +14,7 @@
 #include <linux/spi/spi.h>
 #include <linux/mutex.h>
 #include <linux/list.h>
+#include <linux/workqueue.h>
 
 #include <drm/drm_atomic_helper.h>
 #include <drm/drm_connector.h>
@@ -42,6 +43,7 @@
 
 #define CMD_WRITE_LINE 0b10000000
 #define CMD_CLEAR_SCREEN 0b00100000
+#define CMD_TOGGLE_VCOM 0b01000000
 
 // Globals
 
@@ -70,6 +72,7 @@ struct sharp_memory_panel
 	struct drm_framebuffer *fb;
 
 	struct timer_list vcom_timer;
+	struct work_struct vcom_work;
 
 	unsigned int height;
 	unsigned int width;
@@ -81,12 +84,55 @@ struct sharp_memory_panel
 
 	struct gpio_desc *gpio_disp;
 	struct gpio_desc *gpio_vcom;
+	struct gpio_desc *gpio_cs;
 };
 
 static inline struct sharp_memory_panel *drm_to_panel(struct drm_device *drm)
 {
 	return container_of(drm, struct sharp_memory_panel, drm);
 }
+
+static int sharp_memory_spi_toggle_vcom(struct sharp_memory_panel *panel)
+{
+	int rc;
+
+	if ((panel == NULL) || (panel->spi == NULL)) {
+		return 0;
+	}
+
+	// Create vcom command SPI transfer
+	panel->cmd_buf[0] = CMD_TOGGLE_VCOM;
+	panel->spi_3_xfers[0].tx_buf = panel->cmd_buf;
+	panel->spi_3_xfers[0].rx_buf = NULL;
+	panel->spi_3_xfers[0].len = 1;
+	panel->trailer_buf[0] = 0;
+	panel->spi_3_xfers[1].tx_buf = panel->trailer_buf;
+	panel->spi_3_xfers[1].rx_buf = NULL;
+	panel->spi_3_xfers[1].len = 1;
+
+	if (panel->gpio_cs) {
+		gpiod_set_value(panel->gpio_cs, 0);
+	}
+
+	// Write command
+	ndelay(80);
+
+	rc = spi_sync_transfer(panel->spi, panel->spi_3_xfers, 2);
+
+	if (panel->gpio_cs) {
+		gpiod_set_value(panel->gpio_cs, 1);
+	}
+
+	return rc;
+}
+
+static void sharp_memory_vcom_work(struct work_struct *work)
+{
+	struct sharp_memory_panel *panel = container_of(work, struct sharp_memory_panel, vcom_work);
+
+	sharp_memory_spi_toggle_vcom(panel);
+}
+
 
 static void vcom_timer_callback(struct timer_list *t)
 {
@@ -95,8 +141,14 @@ static void vcom_timer_callback(struct timer_list *t)
 	struct sharp_memory_panel *panel = from_timer(panel, t, vcom_timer);
 
 	// Toggle the GPIO pin
-	vcom_setting = (vcom_setting) ? 0 : 1;
-	gpiod_set_value(panel->gpio_vcom, vcom_setting);
+	if (panel->gpio_vcom) {
+		vcom_setting = (vcom_setting) ? 0 : 1;
+		gpiod_set_value(panel->gpio_vcom, vcom_setting);
+
+	// Send VCOM command
+	} else {
+		schedule_work(&panel->vcom_work);
+	}
 
 	// Reschedule the timer
 	mod_timer(&panel->vcom_timer, jiffies + msecs_to_jiffies(1000));
@@ -106,18 +158,32 @@ static int sharp_memory_spi_clear_screen(struct sharp_memory_panel *panel)
 {
 	int rc;
 
+	if ((panel == NULL) || (panel->spi == NULL)) {
+		return 0;
+	}
+
 	// Create screen clear command SPI transfer
 	panel->cmd_buf[0] = CMD_CLEAR_SCREEN;
 	panel->spi_3_xfers[0].tx_buf = panel->cmd_buf;
+	panel->spi_3_xfers[0].rx_buf = NULL;
 	panel->spi_3_xfers[0].len = 1;
 	panel->trailer_buf[0] = 0;
 	panel->spi_3_xfers[1].tx_buf = panel->trailer_buf;
+	panel->spi_3_xfers[1].rx_buf = NULL;
 	panel->spi_3_xfers[1].len = 1;
+
+	if (panel->gpio_cs) {
+		gpiod_set_value(panel->gpio_cs, 0);
+	}
 
 	// Write clear screen command
 	ndelay(80);
 
 	rc = spi_sync_transfer(panel->spi, panel->spi_3_xfers, 2);
+
+	if (panel->gpio_cs) {
+		gpiod_set_value(panel->gpio_cs, 1);
+	}
 
 	return rc;
 }
@@ -135,23 +201,38 @@ static int sharp_memory_spi_write_tagged_lines(struct sharp_memory_panel *panel,
 {
 	int rc;
 
+	if ((panel == NULL) || (panel->spi == NULL)) {
+		return 0;
+	}
+
 	// Write line command
 	panel->cmd_buf[0] = 0b10000000;
 	panel->spi_3_xfers[0].tx_buf = panel->cmd_buf;
+	panel->spi_3_xfers[0].rx_buf = NULL;
 	panel->spi_3_xfers[0].len = 1;
 
 	// Line data
 	panel->spi_3_xfers[1].tx_buf = line_data;
+	panel->spi_3_xfers[1].rx_buf = NULL;
 	panel->spi_3_xfers[1].len = len;
 
 	// Trailer
 	panel->trailer_buf[0] = 0;
 	panel->spi_3_xfers[2].tx_buf = panel->trailer_buf;
+	panel->spi_3_xfers[2].rx_buf = NULL;
 	panel->spi_3_xfers[2].len = 1;
+
+	if (panel->gpio_cs) {
+		gpiod_set_value(panel->gpio_cs, 0);
+	}
 
 	ndelay(80);
 
 	rc = spi_sync_transfer(panel->spi, panel->spi_3_xfers, 3);
+
+	if (panel->gpio_cs) {
+		gpiod_set_value(panel->gpio_cs, 1);
+	}
 
 	return rc;
 }
@@ -348,7 +429,9 @@ static void power_off(struct sharp_memory_panel *panel)
 	if (panel->gpio_disp) {
 		gpiod_set_value(panel->gpio_disp, 0);
 	}
-	gpiod_set_value(panel->gpio_vcom, 0);
+	if (panel->gpio_vcom) {
+		gpiod_set_value(panel->gpio_vcom, 0);
+	}
 }
 
 static void sharp_memory_pipe_enable(struct drm_simple_display_pipe *pipe,
@@ -373,7 +456,12 @@ static void sharp_memory_pipe_enable(struct drm_simple_display_pipe *pipe,
 	if (panel->gpio_disp) {
 		gpiod_set_value(panel->gpio_disp, 1);
 	}
-	gpiod_set_value(panel->gpio_vcom, 0);
+	if (panel->gpio_vcom) {
+		gpiod_set_value(panel->gpio_vcom, 0);
+	}
+	if (panel->gpio_cs) {
+		gpiod_set_value(panel->gpio_cs, 1);
+	}
 	usleep_range(5000, 10000);
 
 	// Clear display
@@ -385,6 +473,7 @@ static void sharp_memory_pipe_enable(struct drm_simple_display_pipe *pipe,
 	}
 
 	// Initialize and schedule the VCOM timer
+	INIT_WORK(&panel->vcom_work, sharp_memory_vcom_work);
 	timer_setup(&panel->vcom_timer, vcom_timer_callback, 0);
 	mod_timer(&panel->vcom_timer, jiffies + msecs_to_jiffies(500));
 
@@ -496,7 +585,7 @@ static const struct drm_driver sharp_memory_driver = {
 	.desc = "Sharp Memory LCD panel",
 	.date = "20230713",
 	.major = 1,
-	.minor = 1,
+	.minor = 5,
 
 	.ioctls = sharp_memory_ioctls,
 	.num_ioctls = ARRAY_SIZE(sharp_memory_ioctls)
@@ -538,8 +627,16 @@ int drm_probe(struct spi_device *spi)
 		return dev_err_probe(dev, PTR_ERR(panel->gpio_disp), "Failed to get GPIO 'disp'\n");
 
 	panel->gpio_vcom = devm_gpiod_get(dev, "vcom", GPIOD_OUT_LOW);
-	if (IS_ERR(panel->gpio_vcom))
-		return dev_err_probe(dev, PTR_ERR(panel->gpio_vcom), "Failed to get GPIO 'vcom'\n");
+	if (IS_ERR(panel->gpio_vcom)) {
+		printk(KERN_INFO "sharp_memory: Failed to get GPIO 'vcom'\n");
+		panel->gpio_vcom = NULL;
+	}
+
+	panel->gpio_cs = devm_gpiod_get(dev, "cs", GPIOD_OUT_HIGH);
+	if (IS_ERR(panel->gpio_cs)) {
+		printk(KERN_INFO "sharp_memory: Failed to get GPIO 'cs'\n");
+		panel->gpio_cs = NULL;
+	}
 
 	// Initalize DRM mode
 	drm = &panel->drm;
@@ -626,7 +723,9 @@ void drm_remove(struct spi_device *spi)
 	if (panel->gpio_disp) {
 		devm_gpiod_put(dev, panel->gpio_disp);
 	}
-	devm_gpiod_put(dev, panel->gpio_vcom);
+	if (panel->gpio_vcom) {
+		devm_gpiod_put(dev, panel->gpio_vcom);
+	}
 
 	drm_dev_unplug(drm);
 	drm_atomic_helper_shutdown(drm);
