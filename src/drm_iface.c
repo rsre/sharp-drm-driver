@@ -32,9 +32,8 @@
 #include <drm/drm_probe_helper.h>
 #include <drm/drm_simple_kms_helper.h>
 
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 6, 0)
-#include <drm/drm_fbdev_generic.h>
-#endif
+#include <drm/drm_client_setup.h>
+#include <drm/drm_fbdev_dma.h>
 
 #include "params_iface.h"
 #include "ioctl_iface.h"
@@ -261,6 +260,7 @@ static int sharp_memory_clip_mono_tagged(struct sharp_memory_panel* panel, size_
 	int rc;
 	struct drm_gem_dma_object *dma_obj;
 	struct iosys_map dst, vmap;
+	struct drm_format_conv_state fmtcnv_state = DRM_FORMAT_CONV_STATE_INIT;
 
 	// Get GEM memory manager
 	dma_obj = drm_fb_dma_get_gem_obj(fb, 0);
@@ -275,7 +275,7 @@ static int sharp_memory_clip_mono_tagged(struct sharp_memory_panel* panel, size_
 	iosys_map_set_vaddr(&dst, buf);
 	iosys_map_set_vaddr(&vmap, dma_obj->vaddr);
 	// DMA `clip` into `buf` and convert to 8-bit grayscale
-	drm_fb_xrgb8888_to_gray8(&dst, NULL, &vmap, fb, clip);
+	drm_fb_xrgb8888_to_gray8(&dst, NULL, &vmap, fb, clip, &fmtcnv_state);
 
 	// End DMA area
 	drm_gem_fb_end_cpu_access(fb, DMA_FROM_DEVICE);
@@ -492,6 +492,7 @@ static const struct drm_driver sharp_memory_driver = {
 	.driver_features = DRIVER_GEM | DRIVER_MODESET | DRIVER_ATOMIC,
 	.fops = &sharp_memory_fops,
 	DRM_GEM_DMA_DRIVER_OPS_VMAP,
+	.fbdev_probe = drm_fbdev_dma_driver_fbdev_probe,
 	.name = "sharp_drm",
 	.desc = "Sharp Memory LCD panel",
 	.date = "20230713",
@@ -598,7 +599,7 @@ int drm_probe(struct spi_device *spi)
 
 	// fbdev setup
 	spi_set_drvdata(spi, drm);
-	drm_fbdev_generic_setup(drm, 0);
+	drm_client_setup(drm, NULL);
 
 	printk(KERN_INFO "sharp_memory: successful probe\n");
 
